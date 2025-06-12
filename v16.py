@@ -247,7 +247,7 @@ class ExecutionAgent:
         self.available_tools = available_tools
         self.tool_dict = {tool.name: tool for tool in available_tools}
         
-        # Enhanced ReAct prompt for workflow execution with better tool usage instructions
+        # Enhanced ReAct prompt for workflow execution with better tool input formatting
         react_template = """You are an intelligent workflow execution agent. You have access to the following tools:
 
 {tools}
@@ -258,30 +258,38 @@ Your role is to execute workflow steps by:
 3. Evaluating tool results against success/failure criteria
 4. Making decisions about next steps based on outcomes
 
+CRITICAL INPUT FORMAT RULES:
+- For tools expecting integers: use plain numbers without quotes (e.g., 935, not "935")
+- For tools expecting lists: use proper list format (e.g., ["item1", "item2"])
+- For tools expecting strings: use plain text without JSON formatting
+- Do NOT wrap simple values in JSON objects unless the tool specifically expects a JSON object
+- Match the exact parameter names defined in the tool signature
+
 Use the following format:
 
 Question: the workflow step you need to execute
 Thought: analyze the objective and determine what needs to be done
 Action: choose the most appropriate action from [{tool_names}]
-Action Input: provide the input as individual parameters, NOT as JSON. For tools with multiple parameters, use the exact parameter names from the tool definition.
+Action Input: provide the input in the EXACT format expected by the tool (check tool signature carefully)
 Observation: analyze the result of the action
 ... (repeat Thought/Action/Action Input/Observation as needed)
 Thought: evaluate if the step objective has been achieved based on success/failure criteria
 Final Answer: provide a clear assessment of whether the step succeeded or failed, with reasoning
 
-IMPORTANT TOOL USAGE RULES:
-1. For tools with single parameters, provide the value directly (e.g., "database_name")
-2. For tools with multiple parameters, use the format: parameter1=value1, parameter2=value2
-3. Never use JSON format in Action Input
-4. Always use the exact parameter names as defined in the tool
-5. For integer parameters, provide numeric values without quotes
-6. For list parameters, use Python list syntax: [item1, item2, item3]
+EXAMPLES OF CORRECT ACTION INPUT FORMATS:
+- For report_file_creator(errorcode: int, required_fields: list[str]):
+  Action Input: errorcode=935, required_fields=["claim_id", "status", "timestamp"]
+- For store_in_audit_db(errorcode: int):
+  Action Input: errorcode=935
+- For validate_data(data_source: str):
+  Action Input: data_source=customer_data
 
 CRITICAL RULES:
 1. If no suitable tool exists for an objective, respond with "NO_SUITABLE_TOOL"
 2. If a tool fails or returns unsatisfactory results, try alternative approaches if available
 3. Always evaluate results against the provided success/failure criteria
 4. If you cannot achieve the objective after trying available tools, respond with "OBJECTIVE_FAILED"
+5. Pay close attention to tool parameter types and format inputs accordingly
 
 Begin!
 
@@ -290,24 +298,221 @@ Thought:{agent_scratchpad}"""
 
         self.react_prompt = PromptTemplate.from_template(react_template)
         
-        # Create enhanced ReAct agent
+        # Create enhanced ReAct agent with custom tool wrapper
+        self.wrapped_tools = [self._wrap_tool_with_input_parser(tool) for tool in available_tools]
+        
         self.react_agent = create_react_agent(
             llm=self.llm,
-            tools=self.available_tools,
+            tools=self.wrapped_tools,
             prompt=self.react_prompt
         )
         
         # Create agent executor with better error handling
         self.agent_executor = AgentExecutor(
             agent=self.react_agent,
-            tools=self.available_tools,
+            tools=self.wrapped_tools,
             verbose=True,
             handle_parsing_errors=True,
             max_iterations=10,
             early_stopping_method="generate",
-            return_intermediate_steps=True  # This helps with debugging
+            return_intermediate_steps=True
         )
+    
+    def _wrap_tool_with_input_parser(self, tool: BaseTool) -> BaseTool:
+        """
+        Wraps a tool with enhanced input parsing to handle ReAct agent output better.
+        """
+        from langchain_core.tools import StructuredTool
+        import inspect
         
+        original_func = tool.func if hasattr(tool, 'func') else None
+        if not original_func:
+            return tool
+        
+        # Get the original function signature
+        sig = inspect.signature(original_func)
+        
+        def enhanced_tool_wrapper(*args, **kwargs):
+            """Enhanced wrapper that parses inputs more intelligently."""
+            try:
+                # If called with a single string argument that looks like structured data
+                if len(args) == 1 and len(kwargs) == 0 and isinstance(args[0], str):
+                    input_str = args[0].strip()
+                    
+                    # Try to parse as key=value pairs
+                    if '=' in input_str and not input_str.startswith('{'):
+                        parsed_kwargs = self._parse_key_value_string(input_str, sig)
+                        if parsed_kwargs:
+                            return original_func(**parsed_kwargs)
+                    
+                    # Try to parse as JSON
+                    elif input_str.startswith('{') and input_str.endswith('}'):
+                        try:
+                            import json
+                            parsed_data = json.loads(input_str)
+                            if isinstance(parsed_data, dict):
+                                # Convert the parsed data to match parameter types
+                                converted_kwargs = self._convert_parameters(parsed_data, sig)
+                                return original_func(**converted_kwargs)
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+                    
+                    # For single parameter functions, try direct conversion
+                    param_names = list(sig.parameters.keys())
+                    if len(param_names) == 1:
+                        param_name = param_names[0]
+                        param_type = sig.parameters[param_name].annotation
+                        
+                        try:
+                            converted_value = self._convert_single_value(input_str, param_type)
+                            return original_func(**{param_name: converted_value})
+                        except (ValueError, TypeError):
+                            pass
+                
+                # Convert kwargs to proper types
+                if kwargs:
+                    converted_kwargs = self._convert_parameters(kwargs, sig)
+                    return original_func(*args, **converted_kwargs)
+                
+                # Fallback to original call
+                return original_func(*args, **kwargs)
+                
+            except Exception as e:
+                print(f"⚠️ Tool input parsing error for {tool.name}: {str(e)}")
+                print(f"   Raw args: {args}")
+                print(f"   Raw kwargs: {kwargs}")
+                # Try the original function as fallback
+                try:
+                    return original_func(*args, **kwargs)
+                except Exception as original_error:
+                    raise Exception(f"Tool execution failed. Original error: {str(original_error)}. Parser error: {str(e)}")
+        
+        # Create new tool with the enhanced wrapper
+        return StructuredTool.from_function(
+            func=enhanced_tool_wrapper,
+            name=tool.name,
+            description=tool.description,
+            args_schema=tool.args_schema if hasattr(tool, 'args_schema') else None
+        )
+    
+    def _parse_key_value_string(self, input_str: str, signature) -> Dict[str, Any]:
+        """
+        Parse key=value formatted string into proper parameters.
+        Example: "errorcode=935, required_fields=['claim_id', 'status']"
+        """
+        try:
+            pairs = []
+            current_pair = ""
+            bracket_count = 0
+            quote_count = 0
+            
+            for char in input_str:
+                if char in '[{':
+                    bracket_count += 1
+                elif char in ']}':
+                    bracket_count -= 1
+                elif char in '"\'':
+                    quote_count = (quote_count + 1) % 2
+                elif char == ',' and bracket_count == 0 and quote_count == 0:
+                    pairs.append(current_pair.strip())
+                    current_pair = ""
+                    continue
+                
+                current_pair += char
+            
+            if current_pair.strip():
+                pairs.append(current_pair.strip())
+            
+            result = {}
+            for pair in pairs:
+                if '=' not in pair:
+                    continue
+                    
+                key, value = pair.split('=', 1)
+                key = key.strip()
+                value = value.strip()
+                
+                # Get expected type from signature
+                if key in signature.parameters:
+                    param_type = signature.parameters[key].annotation
+                    converted_value = self._convert_single_value(value, param_type)
+                    result[key] = converted_value
+                else:
+                    result[key] = value
+            
+            return result
+            
+        except Exception as e:
+            print(f"⚠️ Failed to parse key-value string: {input_str}. Error: {str(e)}")
+            return {}
+    
+    def _convert_single_value(self, value_str: str, param_type):
+        """Convert a string value to the expected parameter type."""
+        import ast
+        
+        # Handle string types
+        if param_type == str or param_type == 'str':
+            return value_str.strip('\'"')
+        
+        # Handle integer types
+        if param_type == int or param_type == 'int':
+            # Remove any non-numeric characters except minus sign
+            import re
+            numeric_str = re.sub(r'[^\d-]', '', value_str)
+            return int(numeric_str) if numeric_str else 0
+        
+        # Handle float types
+        if param_type == float or param_type == 'float':
+            import re
+            numeric_str = re.sub(r'[^\d.-]', '', value_str)
+            return float(numeric_str) if numeric_str else 0.0
+        
+        # Handle list types
+        if hasattr(param_type, '__origin__') and param_type.__origin__ == list:
+            try:
+                # Try to parse as Python literal
+                if value_str.startswith('[') and value_str.endswith(']'):
+                    return ast.literal_eval(value_str)
+                else:
+                    # Split by comma and clean up
+                    items = [item.strip().strip('\'"') for item in value_str.split(',')]
+                    return [item for item in items if item]
+            except:
+                return [value_str]  # Fallback to single item list
+        
+        # Handle bool types
+        if param_type == bool or param_type == 'bool':
+            return value_str.lower() in ('true', '1', 'yes', 'on')
+        
+        # Try literal evaluation for complex types
+        try:
+            return ast.literal_eval(value_str)
+        except:
+            return value_str
+    
+    def _convert_parameters(self, params: Dict[str, Any], signature) -> Dict[str, Any]:
+        """Convert parameter dictionary to proper types based on function signature."""
+        converted = {}
+        
+        for key, value in params.items():
+            if key in signature.parameters:
+                param_type = signature.parameters[key].annotation
+                
+                # Skip conversion if already correct type
+                if param_type != inspect.Parameter.empty and isinstance(value, param_type):
+                    converted[key] = value
+                    continue
+                
+                # Convert string values
+                if isinstance(value, str):
+                    converted[key] = self._convert_single_value(value, param_type)
+                else:
+                    converted[key] = value
+            else:
+                converted[key] = value
+        
+        return converted
+    
     def execute_step(self, state: AgentState) -> AgentState:
         """
         Enhanced step execution using ReAct pattern for intelligent decision making.
@@ -414,10 +619,11 @@ Thought:{agent_scratchpad}"""
             if req in state["context_data"]:
                 available_context[req] = state["context_data"][req]
         
-        # Get detailed tool information for better parameter usage
-        tool_info = self._get_detailed_tool_info()
+        # Add error code to context if available
+        if state.get("error_code"):
+            available_context["error_code"] = state["error_code"]
         
-        # Create comprehensive question for ReAct agent
+        # Create comprehensive question for ReAct agent with enhanced tool usage instructions
         question = f"""
         WORKFLOW STEP EXECUTION:
         
@@ -434,21 +640,16 @@ Thought:{agent_scratchpad}"""
         Previous Step Result:
         {json.dumps(state.get('last_tool_result', {}), indent=2)}
         
-        Error Code: {state.get('error_code', 'N/A')}
-        
-        DETAILED TOOL INFORMATION:
-        {tool_info}
+        IMPORTANT TOOL USAGE INSTRUCTIONS:
+        - When using tools that require integers (like error codes), provide plain numbers: errorcode=935
+        - When using tools that require lists, use proper list format: required_fields=["field1", "field2"]
+        - When using tools that require strings, provide plain text: data_source=customer_data
+        - Do NOT wrap simple values in JSON objects unless specifically required
+        - Check the tool signature carefully and match parameter names exactly
         
         Your task is to achieve the objective using the available tools. 
-        Follow the tool parameter formats exactly as specified above.
         Evaluate your results against the success/failure criteria.
         If you cannot find suitable tools or achieve the objective, clearly state this in your Final Answer.
-        
-        REMEMBER: 
-        - Use correct parameter names and formats for each tool
-        - For integer parameters, use numbers without quotes
-        - For list parameters, use Python list format [item1, item2, item3]
-        - Never use JSON format in Action Input
         """
         
         try:
@@ -489,19 +690,14 @@ Thought:{agent_scratchpad}"""
             if hasattr(result, 'get') and 'intermediate_steps' in result:
                 for step_result in result['intermediate_steps']:
                     if len(step_result) > 1:
-                        action = step_result[0]
-                        tool_name = action.tool if hasattr(action, 'tool') else 'unknown'
-                        tool_input = action.tool_input if hasattr(action, 'tool_input') else {}
+                        tool_name = step_result[0].tool if hasattr(step_result[0], 'tool') else 'unknown'
                         tool_output = step_result[1]
-                        
                         tool_results.append({
                             "tool": tool_name,
-                            "input": tool_input,
                             "output": tool_output
                         })
                         # Extract potential context data
                         context_data[f"{tool_name}_result"] = tool_output
-                        context_data[f"{tool_name}_input"] = tool_input
             
             return {
                 "status": result_analysis["status"],
@@ -525,43 +721,6 @@ Thought:{agent_scratchpad}"""
                 "message": f"ReAct execution failed: {str(e)}"
             }
     
-    def _get_detailed_tool_info(self) -> str:
-        """
-        Get detailed information about available tools including parameter specifications.
-        """
-        tool_info = []
-        for tool in self.available_tools:
-            tool_name = tool.name
-            tool_description = tool.description
-            
-            # Get tool schema for parameter information
-            tool_schema = tool.args_schema
-            param_info = []
-            
-            if tool_schema:
-                # Extract parameter information from the schema
-                if hasattr(tool_schema, '__fields__'):
-                    for field_name, field_info in tool_schema.__fields__.items():
-                        field_type = field_info.annotation
-                        param_info.append(f"    - {field_name}: {field_type}")
-                elif hasattr(tool_schema, 'model_fields'):
-                    for field_name, field_info in tool_schema.model_fields.items():
-                        field_type = field_info.annotation
-                        param_info.append(f"    - {field_name}: {field_type}")
-            
-            param_details = "\n".join(param_info) if param_info else "    - No parameters required"
-            
-            tool_info.append(f"""
-{tool_name}:
-  Description: {tool_description}
-  Parameters:
-{param_details}
-  Usage example: Action: {tool_name}
-                Action Input: parameter_name=value (for single param) or param1=value1, param2=value2 (for multiple params)
-""")
-        
-        return "\n".join(tool_info)
-    
     def _analyze_agent_result(self, agent_output: str, success_criteria: str, failure_criteria: str) -> Dict[str, Any]:
         """
         Analyze the ReAct agent output to determine success/failure.
@@ -569,8 +728,8 @@ Thought:{agent_scratchpad}"""
         output_lower = agent_output.lower()
         
         # Enhanced success/failure detection
-        success_indicators = ['success', 'completed', 'achieved', 'valid', 'connected', 'verified', 'passed', 'delivered', 'created']
-        failure_indicators = ['failed', 'error', 'invalid', 'disconnected', 'rejected', 'unable', 'cannot', 'timeout']
+        success_indicators = ['success', 'completed', 'achieved', 'valid', 'connected', 'verified', 'passed']
+        failure_indicators = ['failed', 'error', 'invalid', 'disconnected', 'rejected', 'unable', 'cannot']
         
         # Check for explicit success/failure in output
         success_count = sum(1 for indicator in success_indicators if indicator in output_lower)
@@ -627,9 +786,6 @@ Thought:{agent_scratchpad}"""
         last_result = state.get("last_tool_result", {})
         context_data = state.get("context_data", {})
         
-        # Get detailed tool information
-        tool_info = self._get_detailed_tool_info()
-        
         evaluation_question = f"""
         CONDITION EVALUATION TASK:
         
@@ -638,12 +794,8 @@ Thought:{agent_scratchpad}"""
         Previous Step Result: {json.dumps(last_result, indent=2)}
         Available Context: {json.dumps(context_data, indent=2)}
         
-        DETAILED TOOL INFORMATION:
-        {tool_info}
-        
         Your task is to evaluate whether the condition/objective is met based on the available information.
         Use the available tools if you need to gather additional information.
-        Follow the tool parameter formats exactly as specified above.
         
         Provide a clear TRUE or FALSE determination with reasoning.
         """
@@ -728,7 +880,7 @@ Thought:{agent_scratchpad}"""
             next_step = "END"
             
         return next_step
-
+    
 def create_multi_agent_workflow(llm: ChatOpenAI, available_tools: List[BaseTool]) -> StateGraph:
     """
     Creates the enhanced multi-agent workflow with ReAct-powered execution.
