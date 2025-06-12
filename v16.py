@@ -247,56 +247,41 @@ class ExecutionAgent:
         self.available_tools = available_tools
         self.tool_dict = {tool.name: tool for tool in available_tools}
         
-        # Get detailed tool schemas for better prompt construction
-        tool_schemas = {}
-        for tool in available_tools:
-            tool_schema = getattr(tool, 'args_schema', None)
-            if tool_schema:
-                schema_info = tool_schema.schema()
-                tool_schemas[tool.name] = schema_info
-        
-        # Enhanced ReAct prompt with better tool parameter handling
+        # Enhanced ReAct prompt for workflow execution with better tool usage instructions
         react_template = """You are an intelligent workflow execution agent. You have access to the following tools:
 
 {tools}
 
-CRITICAL TOOL USAGE RULES:
-1. For tools with integer parameters: Use plain integers (e.g., 935, not "935" or "errorcode-935")
-2. For tools with list parameters: Use proper Python list syntax (e.g., ["item1", "item2"])
-3. For tools with string parameters: Use plain strings without extra quotes
-4. NEVER use JSON format for Action Input - use the exact parameter values directly
-5. If a tool expects multiple parameters, provide them as comma-separated values in the correct order
-
-PARAMETER FORMAT EXAMPLES:
-- Single integer: 935
-- Single string: customer_data
-- Multiple parameters: 935, ["field1", "field2"]
-- String and integer: database_name, 60
-
 Your role is to execute workflow steps by:
 1. Understanding the objective of each step
 2. Choosing the most appropriate tool(s) to achieve the objective
-3. Using tools with CORRECT parameter formats (no JSON wrapping)
-4. Evaluating tool results against success/failure criteria
-5. Making decisions about next steps based on outcomes
+3. Evaluating tool results against success/failure criteria
+4. Making decisions about next steps based on outcomes
 
 Use the following format:
 
 Question: the workflow step you need to execute
 Thought: analyze the objective and determine what needs to be done
 Action: choose the most appropriate action from [{tool_names}]
-Action Input: provide the parameter values in the correct format (NOT JSON)
+Action Input: provide the input as individual parameters, NOT as JSON. For tools with multiple parameters, use the exact parameter names from the tool definition.
 Observation: analyze the result of the action
 ... (repeat Thought/Action/Action Input/Observation as needed)
 Thought: evaluate if the step objective has been achieved based on success/failure criteria
 Final Answer: provide a clear assessment of whether the step succeeded or failed, with reasoning
+
+IMPORTANT TOOL USAGE RULES:
+1. For tools with single parameters, provide the value directly (e.g., "database_name")
+2. For tools with multiple parameters, use the format: parameter1=value1, parameter2=value2
+3. Never use JSON format in Action Input
+4. Always use the exact parameter names as defined in the tool
+5. For integer parameters, provide numeric values without quotes
+6. For list parameters, use Python list syntax: [item1, item2, item3]
 
 CRITICAL RULES:
 1. If no suitable tool exists for an objective, respond with "NO_SUITABLE_TOOL"
 2. If a tool fails or returns unsatisfactory results, try alternative approaches if available
 3. Always evaluate results against the provided success/failure criteria
 4. If you cannot achieve the objective after trying available tools, respond with "OBJECTIVE_FAILED"
-5. NEVER wrap Action Input in JSON format - use direct parameter values
 
 Begin!
 
@@ -318,9 +303,9 @@ Thought:{agent_scratchpad}"""
             tools=self.available_tools,
             verbose=True,
             handle_parsing_errors=True,
-            max_iterations=15,  # Increased for more thorough reasoning
+            max_iterations=10,
             early_stopping_method="generate",
-            return_intermediate_steps=True  # Important for debugging
+            return_intermediate_steps=True  # This helps with debugging
         )
         
     def execute_step(self, state: AgentState) -> AgentState:
@@ -423,25 +408,14 @@ Thought:{agent_scratchpad}"""
         context_requirements = step.get("context_requirements", [])
         step_description = step.get("description", "")
         
-        # Prepare context information including error code
-        available_context = {"error_code": state["error_code"]}
+        # Prepare context information
+        available_context = {}
         for req in context_requirements:
             if req in state["context_data"]:
                 available_context[req] = state["context_data"][req]
         
-        # Create detailed tool parameter guidance
-        tool_param_guidance = []
-        for tool in self.available_tools:
-            tool_schema = getattr(tool, 'args_schema', None)
-            if tool_schema:
-                schema_info = tool_schema.schema()
-                params = []
-                for prop_name, prop_info in schema_info.get('properties', {}).items():
-                    param_type = prop_info.get('type', 'unknown')
-                    param_desc = prop_info.get('description', '')
-                    params.append(f"      {prop_name}: {param_type} - {param_desc}")
-                param_str = "\n".join(params) if params else "      No parameters"
-                tool_param_guidance.append(f"    {tool.name}:\n{param_str}")
+        # Get detailed tool information for better parameter usage
+        tool_info = self._get_detailed_tool_info()
         
         # Create comprehensive question for ReAct agent
         question = f"""
@@ -460,19 +434,21 @@ Thought:{agent_scratchpad}"""
         Previous Step Result:
         {json.dumps(state.get('last_tool_result', {}), indent=2)}
         
-        TOOL PARAMETER REQUIREMENTS:
-        {chr(10).join(tool_param_guidance)}
+        Error Code: {state.get('error_code', 'N/A')}
         
-        CRITICAL PARAMETER RULES:
-        - For integer parameters like 'errorcode': Use plain integers (e.g., 935)
-        - For list parameters like 'required_fields': Use Python list format (e.g., ["field1", "field2"])
-        - For string parameters: Use plain strings without extra quotes
-        - NEVER wrap parameters in JSON format
-        - Error code from context is: {state["error_code"]}
+        DETAILED TOOL INFORMATION:
+        {tool_info}
         
-        Your task is to achieve the objective using the available tools with CORRECT parameter formats.
+        Your task is to achieve the objective using the available tools. 
+        Follow the tool parameter formats exactly as specified above.
         Evaluate your results against the success/failure criteria.
         If you cannot find suitable tools or achieve the objective, clearly state this in your Final Answer.
+        
+        REMEMBER: 
+        - Use correct parameter names and formats for each tool
+        - For integer parameters, use numbers without quotes
+        - For list parameters, use Python list format [item1, item2, item3]
+        - Never use JSON format in Action Input
         """
         
         try:
@@ -513,14 +489,19 @@ Thought:{agent_scratchpad}"""
             if hasattr(result, 'get') and 'intermediate_steps' in result:
                 for step_result in result['intermediate_steps']:
                     if len(step_result) > 1:
-                        tool_name = step_result[0].tool if hasattr(step_result[0], 'tool') else 'unknown'
+                        action = step_result[0]
+                        tool_name = action.tool if hasattr(action, 'tool') else 'unknown'
+                        tool_input = action.tool_input if hasattr(action, 'tool_input') else {}
                         tool_output = step_result[1]
+                        
                         tool_results.append({
                             "tool": tool_name,
+                            "input": tool_input,
                             "output": tool_output
                         })
                         # Extract potential context data
                         context_data[f"{tool_name}_result"] = tool_output
+                        context_data[f"{tool_name}_input"] = tool_input
             
             return {
                 "status": result_analysis["status"],
@@ -544,6 +525,43 @@ Thought:{agent_scratchpad}"""
                 "message": f"ReAct execution failed: {str(e)}"
             }
     
+    def _get_detailed_tool_info(self) -> str:
+        """
+        Get detailed information about available tools including parameter specifications.
+        """
+        tool_info = []
+        for tool in self.available_tools:
+            tool_name = tool.name
+            tool_description = tool.description
+            
+            # Get tool schema for parameter information
+            tool_schema = tool.args_schema
+            param_info = []
+            
+            if tool_schema:
+                # Extract parameter information from the schema
+                if hasattr(tool_schema, '__fields__'):
+                    for field_name, field_info in tool_schema.__fields__.items():
+                        field_type = field_info.annotation
+                        param_info.append(f"    - {field_name}: {field_type}")
+                elif hasattr(tool_schema, 'model_fields'):
+                    for field_name, field_info in tool_schema.model_fields.items():
+                        field_type = field_info.annotation
+                        param_info.append(f"    - {field_name}: {field_type}")
+            
+            param_details = "\n".join(param_info) if param_info else "    - No parameters required"
+            
+            tool_info.append(f"""
+{tool_name}:
+  Description: {tool_description}
+  Parameters:
+{param_details}
+  Usage example: Action: {tool_name}
+                Action Input: parameter_name=value (for single param) or param1=value1, param2=value2 (for multiple params)
+""")
+        
+        return "\n".join(tool_info)
+    
     def _analyze_agent_result(self, agent_output: str, success_criteria: str, failure_criteria: str) -> Dict[str, Any]:
         """
         Analyze the ReAct agent output to determine success/failure.
@@ -551,8 +569,8 @@ Thought:{agent_scratchpad}"""
         output_lower = agent_output.lower()
         
         # Enhanced success/failure detection
-        success_indicators = ['success', 'completed', 'achieved', 'valid', 'connected', 'verified', 'passed', 'created', 'saved']
-        failure_indicators = ['failed', 'error', 'invalid', 'disconnected', 'rejected', 'unable', 'cannot', 'validation error']
+        success_indicators = ['success', 'completed', 'achieved', 'valid', 'connected', 'verified', 'passed', 'delivered', 'created']
+        failure_indicators = ['failed', 'error', 'invalid', 'disconnected', 'rejected', 'unable', 'cannot', 'timeout']
         
         # Check for explicit success/failure in output
         success_count = sum(1 for indicator in success_indicators if indicator in output_lower)
@@ -609,6 +627,9 @@ Thought:{agent_scratchpad}"""
         last_result = state.get("last_tool_result", {})
         context_data = state.get("context_data", {})
         
+        # Get detailed tool information
+        tool_info = self._get_detailed_tool_info()
+        
         evaluation_question = f"""
         CONDITION EVALUATION TASK:
         
@@ -617,8 +638,12 @@ Thought:{agent_scratchpad}"""
         Previous Step Result: {json.dumps(last_result, indent=2)}
         Available Context: {json.dumps(context_data, indent=2)}
         
+        DETAILED TOOL INFORMATION:
+        {tool_info}
+        
         Your task is to evaluate whether the condition/objective is met based on the available information.
         Use the available tools if you need to gather additional information.
+        Follow the tool parameter formats exactly as specified above.
         
         Provide a clear TRUE or FALSE determination with reasoning.
         """
@@ -703,8 +728,6 @@ Thought:{agent_scratchpad}"""
             next_step = "END"
             
         return next_step
-
-
 
 def create_multi_agent_workflow(llm: ChatOpenAI, available_tools: List[BaseTool]) -> StateGraph:
     """
