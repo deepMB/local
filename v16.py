@@ -237,6 +237,8 @@ class PlanningAgent:
         return playbook_json
 
 
+
+
 class ExecutionAgent:
     """
     Enhanced Execution Agent that uses ReAct pattern for intelligent tool selection and decision making.
@@ -305,6 +307,17 @@ Thought:{agent_scratchpad}"""
             llm=self.llm,
             tools=self.wrapped_tools,
             prompt=self.react_prompt
+        )
+        # Inside __init__ method:
+        tool_args_info = []
+        for tool in self.available_tools:
+            schema = tool.args_schema.schema() if tool.args_schema else {}
+            args = schema.get("properties", {})
+            arg_desc = ", ".join([f"{k}: {v.get('type', 'string')}" for k,v in args.items()])
+            tool_args_info.append(f"{tool.name}: {arg_desc}")
+
+        self.react_prompt = self.react_prompt.partial(
+            tool_args="\n".join(tool_args_info)
         )
         
         # Create agent executor with better error handling
@@ -394,6 +407,40 @@ Thought:{agent_scratchpad}"""
             description=tool.description,
             args_schema=tool.args_schema if hasattr(tool, 'args_schema') else None
         )
+    
+    from langchain.callbacks.base import BaseCallbackHandler
+
+    class _InputValidatorCallback(BaseCallbackHandler):
+        def on_tool_start(self, serialized, input_str, **kwargs):
+            tool_name = serialized["name"]
+            try:
+                validated = self._validate_tool_input(tool_name, input_str)
+                return validated
+            except ValueError as e:
+                return str(e)  # Return error to agent
+
+        @property
+        def _input_validator_callback(self):
+            return self._InputValidatorCallback()
+        
+
+    def _validate_tool_input(self, tool_name: str, input_str: str) -> dict:
+        """Validate and parse tool input"""
+        tool = self.tool_dict.get(tool_name)
+        if not tool:
+            raise ValueError(f"Tool {tool_name} not found")
+        
+        try:
+            # Parse JSON input
+            input_data = json.loads(input_str) if isinstance(input_str, str) else input_str
+            
+            # Validate against schema
+            if tool.args_schema:
+                validated = tool.args_schema(**input_data)
+                return validated.dict()
+            return input_data
+        except Exception as e:
+            raise ValueError(f"Invalid input for {tool_name}: {str(e)}")
     
     def _parse_key_value_string(self, input_str: str, signature) -> Dict[str, Any]:
         """
@@ -603,6 +650,9 @@ Thought:{agent_scratchpad}"""
             
         return state
     
+    # Add to ExecutionAgent class
+
+    
     def _execute_objective_step(self, step: Dict[str, Any], state: AgentState) -> Dict[str, Any]:
         """
         Execute an objective-based step using ReAct agent for intelligent tool selection.
@@ -656,7 +706,7 @@ Thought:{agent_scratchpad}"""
             print(f"🤖 ReAct Agent executing objective: {objective}")
             
             # Use ReAct agent to execute the step
-            result = self.agent_executor.invoke({"input": question})
+            result = self.agent_executor.invoke({"input": question},config={"callbacks": [self._input_validator_callback])
             agent_output = result.get('output', '') if hasattr(result, 'get') else str(result)
             
             print(f"🔍 ReAct Agent Output: {agent_output}")
