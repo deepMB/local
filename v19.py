@@ -8,6 +8,8 @@ from langchain_core.prompts import PromptTemplate
 import json
 import re
 from pydantic import BaseModel, Field
+import asyncio
+from langchain_mcp_adapters.client import MultiServerMCPClient
 
 # Agent State Definition
 class AgentState(TypedDict):
@@ -310,7 +312,7 @@ Thought:{agent_scratchpad}"""
             early_stopping_method="generate"
         )
         
-    def execute_step(self, state: AgentState) -> AgentState:
+    async def execute_step(self, state: AgentState) -> AgentState:
         """
         Enhanced step execution using ReAct pattern for intelligent decision making.
         """
@@ -347,11 +349,11 @@ Thought:{agent_scratchpad}"""
         try:
             # Execute the step using ReAct pattern
             if current_step["action"] == "achieve_objective":
-                result = self._execute_objective_step(current_step, state)
+                result = await self._execute_objective_step(current_step, state)
             elif current_step["action"] == "evaluate_condition":
-                result = self._evaluate_condition_step(current_step, state)
+                result = await self._evaluate_condition_step(current_step, state)
             elif current_step["action"] == "notify":
-                result = self._notify_step(current_step, state)
+                result = await self._notify_step(current_step, state)
             else:
                 result = {"status": "success", "message": f"Executed step: {current_step['name']}"}
             
@@ -400,7 +402,7 @@ Thought:{agent_scratchpad}"""
             
         return state
     
-    def _execute_objective_step(self, step: Dict[str, Any], state: AgentState) -> Dict[str, Any]:
+    async def _execute_objective_step(self, step: Dict[str, Any], state: AgentState) -> Dict[str, Any]:
         """
         Execute an objective-based step using ReAct agent for intelligent tool selection.
         """
@@ -452,7 +454,7 @@ Thought:{agent_scratchpad}"""
             print(f"🤖 ReAct Agent executing objective: {objective}")
             
             # Use ReAct agent to execute the step
-            result = self.agent_executor.invoke({"input": question})
+            result = await self.agent_executor.invoke({"input": question})
             agent_output = result.get('output', '') if hasattr(result, 'get') else str(result)
             
             print(f"🔍 ReAct Agent Output: {agent_output}")
@@ -576,7 +578,7 @@ Thought:{agent_scratchpad}"""
                 "confidence": "indicator_based"
             }
     
-    def _evaluate_condition_step(self, step: Dict[str, Any], state: AgentState) -> Dict[str, Any]:
+    async def _evaluate_condition_step(self, step: Dict[str, Any], state: AgentState) -> Dict[str, Any]:
         """Enhanced condition evaluation using ReAct reasoning."""
         objective = step.get("objective", "")
         last_result = state.get("last_tool_result", {})
@@ -597,7 +599,7 @@ Thought:{agent_scratchpad}"""
         """
         
         try:
-            result = self.agent_executor.invoke({"input": evaluation_question})
+            result = await self.agent_executor.invoke({"input": evaluation_question})
             agent_output = result.get('output', '') if hasattr(result, 'get') else str(result)
             
             # Determine condition result
@@ -639,7 +641,7 @@ Thought:{agent_scratchpad}"""
         
         return positive_count > negative_count
     
-    def _notify_step(self, step: Dict[str, Any], state: AgentState) -> Dict[str, Any]:
+    async def _notify_step(self, step: Dict[str, Any], state: AgentState) -> Dict[str, Any]:
         """Enhanced notification step."""
         objective = step.get("objective", "")
         description = step.get("description", "")
@@ -746,170 +748,81 @@ if __name__ == "__main__":
     from langchain_core.tools import tool
     
     # Enhanced mock tools for demonstration
-    @tool
-    def validate_data(data_source: str) -> str:
-        """Validates data from the specified source."""
-        # Simulate potential failure
-        if "invalid" in data_source.lower():
-            return f"Data validation FAILED for {data_source} - Status: Invalid data format"
-        return f"Data validation COMPLETED for {data_source} - Status: Valid, 1000 records processed"
+    async def main():
+        # Initialize MCP client
+        client = MultiServerMCPClient({
+            "weather": {
+            # make sure you start your weather server on port 8000
+            "url": "http://localhost:8000/mcp/",
+            "transport": "streamable_http",
+        }
+        })
+        
+        # Initialize LLM (replace with your preferred LLM)
+        llm = ChatOpenAI(model="gpt-4", temperature=0)
+        
+        # Get tools from MCP servers
+        tools = await client.get_tools()
+        # Create the enhanced multi-agent workflow
+        workflow = create_multi_agent_workflow(llm, tools)
     
-    @tool
-    def check_database_connection(database_name: str) -> str:
-        """Checks connection to the specified database."""
-        # Simulate connection scenarios
-        if "test" in database_name.lower():
-            return f"Database connection FAILED for {database_name} - Status: Connection timeout"
-        return f"Database connection VERIFIED for {database_name} - Status: Connected, latency 45ms"
+        # Compile the graph
+        app = workflow.compile()
     
-    @tool
-    def execute_query(query: str) -> str:
-        """Executes a database query."""
-        if len(query) < 10:
-            return f"Query execution FAILED: {query} - Status: Invalid query format"
-        return f"Query executed SUCCESSFULLY: {query} - Rows affected: 150, execution time: 0.3s"
-    
-    @tool
-    def send_notification(message: str, recipient: str) -> str:
-        """Sends a notification message."""
-        return f"Notification DELIVERED to {recipient}: {message} - Status: Sent via email"
-    
-    @tool 
-    def repair_data(data_source: str, repair_type: str) -> str:
-        """Repairs data issues in the specified source."""
-        return f"Data repair COMPLETED for {data_source} using {repair_type} - Status: 45 records fixed"
-    @tool
-    def report_file_creator(errorcode: int, required_fields: list[str]) -> str:
+        # Enhanced example SOP content with more complex logic
+        sample_sop = """
+        SOP for Error Code 935 - Data Validation Failure
+        
+        OBJECTIVE: Resolve data validation issues and ensure system integrity
+        
+        WORKFLOW:
+        1. VALIDATE DATA SOURCE: Check the integrity of 'customer_data' source
+        - IF validation passes: Proceed to step 6 (success notification)
+        - IF validation fails: Continue to step 2
+        
+        2. DIAGNOSE CONNECTION: Verify database connectivity to 'main_db'
+        - IF connection is healthy: Proceed to step 3
+        - IF connection fails: Send error notification and END
+        
+        3. REPAIR DATA: Execute data repair using 'cleanup' method on 'customer_data'
+        - IF repair succeeds: Proceed to step 4
+        - IF repair fails: Send error notification and END
+        
+        4. RE-VALIDATE: Re-check the 'customer_data' after repair
+        - IF validation now passes: Proceed to step 5
+        - IF validation still fails: Send failure notification and END
+        
+        5. EXECUTE MAINTENANCE: Run maintenance query 'UPDATE customers SET status = active WHERE status IS NULL'
+        - IF query succeeds: Proceed to step 6
+        - IF query fails: Send error notification and END
+        
+        6. SUCCESS NOTIFICATION: Send success notification to 'admin@company.com'
+        - Always END after this step
+        
+        ERROR HANDLING: For any unexpected errors, send detailed error notification to 'admin@company.com' and END
         """
-        Creates a report file for a given error code with specified fields.
-        Args:
-            errorcode (int): The error code for the report.
-            required_fields (list[str]): A list of fields to include in the report.
-        Returns:
-            str: A confirmation message indicating the report file was created.
-        """
-        # ---- rest of the code -----
-        print(f"Tool 'report_file_creator' called with errorcode: {errorcode} and fields: {required_fields}")
-        return f"Report file created for error {errorcode}."
-
-    @tool
-    def store_in_audit_db(errorcode: int) -> str:
-        """
-        Stores a record in the audit table based on the provided error code.
-        Args:
-            errorcode (int): The error code associated with the record to be stored (e.g., 123).
-        Returns:
-            str: A confirmation message indicating that the data has been successfully saved to the audit table.
-        """
-        print(f"tool audit called with error code: {errorcode}")
-        return "Data saved"
-    # Initialize LLM (replace with your preferred LLM)
-    llm = ChatOpenAI(model="gpt-4", temperature=0)
-    
-    # Available tools
-    tools = [validate_data, check_database_connection, execute_query, send_notification, repair_data, store_in_audit_db, report_file_creator]
-
-    # Create the enhanced multi-agent workflow
-    workflow = create_multi_agent_workflow(llm, tools)
-    
-    # Compile the graph
-    app = workflow.compile()
-    
-    # Enhanced example SOP content with more complex logic
-    sample_sop = """
-    SOP for Error Code 935 - Data Validation Failure
-    
-    OBJECTIVE: Resolve data validation issues and ensure system integrity
-    
-    WORKFLOW:
-    1. VALIDATE DATA SOURCE: Check the integrity of 'customer_data' source
-       - IF validation passes: Proceed to step 6 (success notification)
-       - IF validation fails: Continue to step 2
-    
-    2. DIAGNOSE CONNECTION: Verify database connectivity to 'main_db'
-       - IF connection is healthy: Proceed to step 3
-       - IF connection fails: Send error notification and END
-    
-    3. REPAIR DATA: Execute data repair using 'cleanup' method on 'customer_data'
-       - IF repair succeeds: Proceed to step 4
-       - IF repair fails: Send error notification and END
-    
-    4. RE-VALIDATE: Re-check the 'customer_data' after repair
-       - IF validation now passes: Proceed to step 5
-       - IF validation still fails: Send failure notification and END
-    
-    5. EXECUTE MAINTENANCE: Run maintenance query 'UPDATE customers SET status = active WHERE status IS NULL'
-       - IF query succeeds: Proceed to step 6
-       - IF query fails: Send error notification and END
-    
-    6. SUCCESS NOTIFICATION: Send success notification to 'admin@company.com'
-       - Always END after this step
-    
-    ERROR HANDLING: For any unexpected errors, send detailed error notification to 'admin@company.com' and END
-    """
-    
-    # Test the enhanced multi-agent system
-    initial_state: AgentState = {
-        "error_code": 935,
-        "sop_content": sample_sop,
-        "playbook": None,
-        "execution_queue": [],
-        "data": None,
-        "last_tool_result": None,
-        "final_output": {},
-        "current_step_id": None,
-        "execution_status": "planning",
-        "execution_log": [],
-        "context_data": {}
-    }
-    
-    # Run the enhanced multi-agent workflow
-    try:
-        print("🚀 Starting Enhanced Multi-Agent Workflow with ReAct Pattern...")
-        print("=" * 70)
         
-        result = app.invoke(initial_state)
+        # Test the enhanced multi-agent system
+        initial_state: AgentState = {
+            "error_code": 935,
+            "sop_content": sample_sop,
+            "playbook": None,
+            "execution_queue": [],
+            "data": None,
+            "last_tool_result": None,
+            "final_output": {},
+            "current_step_id": None,
+            "execution_status": "planning",
+            "execution_log": [],
+            "context_data": {}
+        }
         
-        print("=" * 70)
-        print("📊 FINAL WORKFLOW RESULTS:")
-        print(f"Execution Status: {result['execution_status']}")
-        print(f"Steps Executed: {len(result.get('execution_log', []))}")
-        
-        if result.get('execution_log'):
-            print("\n📋 DETAILED EXECUTION LOG:")
-            for i, log_entry in enumerate(result['execution_log'], 1):
-                print(f"\n{i}. STEP: {log_entry['step_name']}")
-                print(f"   Objective: {log_entry.get('objective', 'N/A')}")
-                print(f"   Result: {log_entry['result'].get('message', 'No message')}")
-                print(f"   Status: {log_entry['result'].get('status', 'Unknown')}")
-                
-                # Show tool results if available
-                if log_entry['result'].get('tool_results'):
-                    print(f"   Tools Used:")
-                    for tool_result in log_entry['result']['tool_results']:
-                        print(f"     - {tool_result.get('tool', 'Unknown')}: {tool_result.get('output', 'No output')}")
-        
-        if result.get('context_data'):
-            print(f"\n🔍 ACCUMULATED CONTEXT DATA:")
-            for key, value in result['context_data'].items():
-                print(f"   {key}: {value}")
-        
-        if result.get('final_output'):
-            print(f"\n🎯 FINAL OUTPUT:")
-            for key, value in result['final_output'].items():
-                print(f"   {key}: {value}")
-                
-        # Show playbook structure
-        if result.get('playbook'):
-            print(f"\n📖 GENERATED PLAYBOOK STRUCTURE:")
-            print(f"   Name: {result['playbook'].get('name', 'Unknown')}")
-            print(f"   Total Steps: {len(result['playbook'].get('steps', {}))}")
-            print(f"   Start Step: {result['playbook'].get('start_step', 'Unknown')}")
+        # Run the enhanced multi-agent workflow
+        result = await app.invoke(initial_state)
             
-            print(f"\n   STEP BREAKDOWN:")
-            for step_id, step_data in result['playbook'].get('steps', {}).items():
-                print(f"     {step_id}: {step_data.get('name', 'Unnamed')} -> {step_data.get('next_steps', {})}")
-    
+    try:       
+    # Run the async main function
+        asyncio.run(main())
     except Exception as e:
         print(f"❌ Error running enhanced multi-agent workflow: {str(e)}")
         import traceback
