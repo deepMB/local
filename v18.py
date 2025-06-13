@@ -1,5 +1,3 @@
-#update the codes of enhanched multiagent local
-
 class ExecutionAgent:
     """
     Enhanced Execution Agent that uses ReAct pattern for intelligent tool selection and decision making.
@@ -9,6 +7,9 @@ class ExecutionAgent:
         self.llm = llm
         self.available_tools = available_tools
         self.tool_dict = {tool.name: tool for tool in available_tools}
+        
+        # Get tool names for the prompt
+        tool_names = [tool.name for tool in available_tools]
         
         # Enhanced ReAct prompt for workflow execution with better argument formatting
         react_template = """You are an intelligent workflow execution agent. You have access to the following tools:
@@ -26,24 +27,19 @@ Use the following format:
 Question: the workflow step you need to execute
 Thought: analyze the objective and determine what needs to be done
 Action: choose the most appropriate action from [{tool_names}]
-Action Input: provide the input as a properly formatted JSON object with correct data types
+Action Input: the input to the action
 Observation: analyze the result of the action
 ... (repeat Thought/Action/Action Input/Observation as needed)
 Thought: evaluate if the step objective has been achieved based on success/failure criteria
 Final Answer: provide a clear assessment of whether the step succeeded or failed, with reasoning
 
 CRITICAL RULES FOR ACTION INPUT:
-1. Always provide Action Input as valid JSON
-2. Ensure integer parameters are passed as numbers, not strings (e.g., 935 not "935")
-3. Ensure string parameters are properly quoted
-4. Ensure list parameters are properly formatted as JSON arrays
-5. Match the exact parameter names expected by the tool
-
-Examples of correct Action Input formatting:
-- For integer parameter: {{"errorcode": 935}}
-- For string parameter: {{"message": "Hello World"}}
-- For list parameter: {{"required_fields": ["field1", "field2"]}}
-- For multiple parameters: {{"errorcode": 935, "required_fields": ["field1", "field2"]}}
+1. For tools with single parameters, provide just the value (e.g., for errorcode parameter, use: 935)
+2. For tools with multiple parameters, provide a valid JSON object (e.g., {{"errorcode": 935, "required_fields": ["field1", "field2"]}})
+3. Ensure integer parameters are passed as numbers, not strings
+4. Ensure string parameters are properly quoted when in JSON
+5. Ensure list parameters are properly formatted as JSON arrays when in JSON
+6. Match the exact parameter names expected by the tool
 
 ADDITIONAL RULES:
 1. If no suitable tool exists for an objective, respond with "NO_SUITABLE_TOOL"
@@ -71,7 +67,7 @@ Thought:{agent_scratchpad}"""
             tools=self.available_tools,
             verbose=True,
             handle_parsing_errors=True,
-            max_iterations=10,  # Increased for more thorough reasoning
+            max_iterations=5,  # Reduced to prevent excessive iterations
             early_stopping_method="generate"
         )
         
@@ -184,22 +180,6 @@ Thought:{agent_scratchpad}"""
         # Get error code from state for tool calls that need it
         error_code = state.get("error_code", 0)
         
-        # Enhanced tool descriptions with parameter examples
-        tool_examples = []
-        for tool in self.available_tools:
-            tool_name = tool.name
-            tool_desc = tool.description
-            
-            # Add specific examples for tools that commonly have parameter issues
-            if "errorcode" in str(tool.args):
-                tool_examples.append(f"- {tool_name}: {tool_desc}")
-                tool_examples.append(f"  Example usage: Action Input: {{\"errorcode\": {error_code}}}")
-            elif "required_fields" in str(tool.args):
-                tool_examples.append(f"- {tool_name}: {tool_desc}")
-                tool_examples.append(f"  Example usage: Action Input: {{\"errorcode\": {error_code}, \"required_fields\": [\"field1\", \"field2\"]}}")
-            else:
-                tool_examples.append(f"- {tool_name}: {tool_desc}")
-        
         # Create comprehensive question for ReAct agent
         question = f"""
         WORKFLOW STEP EXECUTION:
@@ -219,14 +199,10 @@ Thought:{agent_scratchpad}"""
         Previous Step Result:
         {json.dumps(state.get('last_tool_result', {}), indent=2)}
         
-        TOOL USAGE EXAMPLES:
-        {chr(10).join(tool_examples)}
-        
-        IMPORTANT PARAMETER FORMATTING RULES:
-        - For errorcode parameters: Use the integer {error_code} (not a string)
-        - For list parameters: Use proper JSON array format like ["item1", "item2"]
-        - For string parameters: Use proper JSON string format like "string_value"
-        - Always ensure your Action Input is valid JSON with correct data types
+        IMPORTANT PARAMETER FORMATTING:
+        - For errorcode parameters: Use the integer {error_code}
+        - For single parameter tools: Provide just the value
+        - For multi-parameter tools: Use JSON format like {{"param1": value1, "param2": value2}}
         
         Your task is to achieve the objective using the available tools. 
         Evaluate your results against the success/failure criteria.
